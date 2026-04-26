@@ -2,94 +2,98 @@ const pdf = require('pdf-parse');
 const axios = require('axios');
 const Analysis = require('../models/Analysis');
 
-// Custom scoring layer on top of Gemini response
 const computeCustomScore = (geminiResult, resumeText) => {
   let bonus = 0;
-
-  // Bonus: quantified achievements (numbers in text)
   const numbers = (resumeText.match(/\d+%|\d+\+|\$\d+|\d+ (users|clients|projects|teams)/gi) || []).length;
   if (numbers >= 5) bonus += 5;
   else if (numbers >= 2) bonus += 2;
-
-  // Bonus: action verbs
   const actionVerbs = ['developed', 'built', 'designed', 'implemented', 'led', 'improved', 'achieved', 'managed', 'created', 'engineered'];
   const verbCount = actionVerbs.filter(v => resumeText.toLowerCase().includes(v)).length;
   if (verbCount >= 6) bonus += 5;
   else if (verbCount >= 3) bonus += 2;
-
-  // Bonus: has GitHub/LinkedIn/portfolio
   if (/github\.com|linkedin\.com|portfolio/i.test(resumeText)) bonus += 3;
-
-  // Bonus: has contact info
   if (/\d{10}|\+\d{2}|\@gmail|\@yahoo/i.test(resumeText)) bonus += 2;
-
   return Math.min(100, (geminiResult.overall_score || 0) + bonus);
 };
 
-// @desc    Analyze resume
-// @route   POST /api/analyze
-// @access  Private
 const analyzeResume = async (req, res) => {
   try {
+    console.log('Analyze request received');
+    console.log('File:', req.file ? req.file.originalname : 'NO FILE');
+    console.log('User:', req.user ? req.user._id : 'NO USER');
+
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'Please upload a resume file' });
     }
 
-    // Parse PDF on server side
+    // Parse PDF
     let resumeText = '';
-    if (req.file.mimetype === 'application/pdf') {
-      const data = await pdf(req.file.buffer);
-      resumeText = data.text;
-    } else {
-      resumeText = req.file.buffer.toString('utf-8');
+    try {
+      if (req.file.mimetype === 'application/pdf') {
+        const data = await pdf(req.file.buffer);
+        resumeText = data.text;
+        console.log('PDF parsed, text length:', resumeText.length);
+      } else {
+        resumeText = req.file.buffer.toString('utf-8');
+        console.log('TXT parsed, text length:', resumeText.length);
+      }
+    } catch (pdfErr) {
+      console.error('PDF parse error:', pdfErr.message);
+      return res.status(400).json({ success: false, message: 'Could not parse PDF. Try a different file.' });
     }
 
-    if (!resumeText || resumeText.trim().length < 50) {
-      return res.status(400).json({ success: false, message: 'Could not extract text from resume. Try a text-based PDF.' });
+    if (!resumeText || resumeText.trim().length < 20) {
+      return res.status(400).json({ success: false, message: 'Could not extract text from resume.' });
     }
 
     const jd = req.body.jobDescription || '';
+    const apiKey = process.env.GEMINI_API_KEY;
 
-    // Build prompt for Gemini
-    const prompt = `You are an expert resume reviewer and career coach. Analyze this resume${jd ? ' against the provided job description' : ''} and return ONLY a valid JSON object with no markdown or backticks.
+    if (!apiKey) {
+      return res.status(500).json({ success: false, message: 'Gemini API key not configured' });
+    }
 
-Resume Text:
-${resumeText.slice(0, 4000)}
+    const prompt = `You are an expert resume reviewer. Analyze this resume and return ONLY valid JSON with no markdown or backticks.
 
-${jd ? `Job Description:\n${jd.slice(0, 1500)}` : ''}
+Resume:
+${resumeText.slice(0, 3000)}
 
-Return exactly this JSON structure:
+${jd ? `Job Description:\n${jd.slice(0, 1000)}` : ''}
+
+Return exactly this JSON:
 {
-  "overall_score": <number 0-100>,
-  "score_label": "<Excellent|Good|Average|Needs Work>",
-  "score_summary": "<one sentence summary>",
-  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],
-  "improvements": ["<improvement 1>", "<improvement 2>", "<improvement 3>"],
-  "skills_found": ["<skill1>", "<skill2>", "<skill3>", "<skill4>", "<skill5>", "<skill6>"],
-  ${jd ? '"skills_matching": ["<skill matching JD>"],' : '"skills_matching": [],'}
-  "ats_score": <number 0-100>,
-  "ats_tips": ["<tip1>", "<tip2>"],
-  "impact_score": <number 0-100>,
-  "impact_tips": ["<tip1>", "<tip2>"],
-  "format_score": <number 0-100>,
-  "format_tips": ["<tip1>", "<tip2>"]
+  "overall_score": 75,
+  "score_label": "Good",
+  "score_summary": "One sentence summary here",
+  "strengths": ["strength 1", "strength 2", "strength 3"],
+  "improvements": ["improvement 1", "improvement 2", "improvement 3"],
+  "skills_found": ["skill1", "skill2", "skill3", "skill4", "skill5"],
+  "skills_matching": [],
+  "ats_score": 70,
+  "ats_tips": ["tip1", "tip2"],
+  "impact_score": 65,
+  "impact_tips": ["tip1", "tip2"],
+  "format_score": 80,
+  "format_tips": ["tip1", "tip2"]
 }`;
 
-    // Call Gemini API (server-side — API key is secure in .env)
+    console.log('Calling Gemini API...');
+
     const geminiResponse = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key=${apiKey}`,
       { contents: [{ parts: [{ text: prompt }] }] },
       { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
     );
 
+    console.log('Gemini response received');
+
     const rawText = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    console.log('Raw Gemini text:', rawText.slice(0, 200));
+
     const cleanText = rawText.replace(/```json|```/g, '').trim();
     const geminiResult = JSON.parse(cleanText);
-
-    // Apply custom scoring layer on top of Gemini
     geminiResult.overall_score = computeCustomScore(geminiResult, resumeText);
 
-    // Save analysis to MongoDB
     const analysis = await Analysis.create({
       user: req.user._id,
       fileName: req.file.originalname,
@@ -97,16 +101,13 @@ Return exactly this JSON structure:
       result: geminiResult
     });
 
-    res.json({
-      success: true,
-      analysisId: analysis._id,
-      result: geminiResult
-    });
+    console.log('Analysis saved, id:', analysis._id);
+
+    res.json({ success: true, analysisId: analysis._id, result: geminiResult });
 
   } catch (error) {
-    if (error.name === 'SyntaxError') {
-      return res.status(500).json({ success: false, message: 'Failed to parse AI response. Please try again.' });
-    }
+    console.error('ANALYZE ERROR:', error.message);
+    console.error('Stack:', error.stack);
     res.status(500).json({ success: false, message: error.message });
   }
 };

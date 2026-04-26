@@ -1,27 +1,26 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const rateLimit = require('express-rate-limit');
+
 const connectDB = require('./config/db');
 
 dotenv.config();
 
 const app = express();
 
+app.set('trust proxy', 1);
+
 // Connect to MongoDB
 connectDB();
 
 // Rate limiting - max 20 requests per 15 minutes per IP
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  message: { success: false, message: 'Too many requests, please try again later.' }
-});
+
 
 // Middleware
+app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000' }));
 app.use(express.json());
-app.use('/api/analyze', limiter);
+
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
